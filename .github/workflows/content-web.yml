@@ -1,31 +1,34 @@
-name: content-web
+me: content-web
 
-# This workflow is triggered on push to the 'content-web' directory of the  main branch of the repository
+# This workflow is triggered on push to the 'content-web' directory of the  master branch of the repository
 on:
-  push:
-    branches:
-    - main
-    paths:
-    - 'content-web/**'
-    # - web.deployment.yml
-    # - web.service.yml
+ push:
+   branches:
+   - master
+   paths:
+   - 'content-web/**'
 
-  # Configure workflow to also support triggering manually
-  workflow_dispatch:
+ # Configure workflow to also support triggering manually
+ workflow_dispatch:
+   inputs:
+     logLevel:
+       description: 'Log level'
+       required: true
+       default: 'warning'
 
 # Environment variables are defined so that they can be used throughout the job definitions.
 env:
-  imageRepository: 'content-web'
-  resourceGroupName: 'fabmedical-[SUFFIX]'
-  clusterName: 'fabmedical-[SUFFIX]'
-  containerRegistryName: 'fabmedical[SUFFIX]'
-  containerRegistry: 'fabmedical[SUFFIX].azurecr.io'
-  dockerfilePath: './content-web'
-  tag: '${{ github.run_id  }}'
+ imageRepository: 'content-web'
+ resourceGroupName: 'fabmedical-pim'
+ containerRegistryName: 'fabmedicalpim'
+ containerRegistry: 'fabmedicalpim.azurecr.io'
+ dockerfilePath: './content-web'
+ tag: '${{ github.run_id  }}'
 
-# Jobs define the actions that take place when code is pushed to the main branch
+# Jobs define the actions that take place when code is pushed to the master branch
 jobs:
-  build-and-publish-docker-image:
+
+ build-and-publish-docker-image:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
     steps:
@@ -52,31 +55,73 @@ jobs:
         tags: |
           ${{ env.containerRegistry }}/${{ env.imageRepository }}:${{ env.tag }}
           ${{ env.containerRegistry }}/${{ env.imageRepository }}:latest
+ build-and-push-helm-chart:
+    name: Build and Push Helm Chart
+    runs-on: ubuntu-latest
+    needs: [build-and-publish-docker-image]
+    steps:
+    # Checkout the repo
+    - uses: actions/checkout@master
 
-    - uses: Azure/aks-set-context@v1
+    - name: Helm Install
+      uses: azure/setup-helm@v1
       with:
-        creds: '${{ secrets.AZURE_CREDENTIALS }}'
-        cluster-name: '${{ env.clusterName }}'
-        resource-group: '${{ env.resourceGroupName }}'
+        version: v3.4.0
 
-    - name: Create ACR credentials secret
-      uses: azure/k8s-create-secret@v1
-      with:
-        container-registry-url: ${{ env.containerRegistry }}.azurecr.io
-        container-registry-username: ${{ secrets.ACR_USERNAME }}
-        container-registry-password: ${{ secrets.ACR_PASSWORD }}
-        secret-name: ingress-demo-secret
-        namespace: ingress-demo
-        arguments: --force true
+    - name: Helm Repo Add
+      run: |
+        helm repo add ${{ env.containerRegistryName }} https://${{ env.containerRegistry }}/helm/v1/repo --username ${{ secrets.ACR_USERNAME }} --password ${{ secrets.ACR_PASSWORD }}
+      env:
+        HELM_EXPERIMENTAL_OCI: 1
+
+    - name: Helm Chart Save
+      run: |
+        cd ./content-web/charts/web
+        helm version
+        helm chart save . content-web:v${{ env.tag }}
+        helm chart save . ${{ env.containerRegistry }}/helm/content-web:v${{ env.tag }}
+        # list out saved charts
+        helm chart list
+      env:
+        HELM_EXPERIMENTAL_OCI: 1
+
+    - name: Helm Chart Push
+      run: |
+        helm registry login ${{ env.containerRegistry }} --username ${{ secrets.ACR_USERNAME }} --password ${{ secrets.ACR_PASSWORD }}
+        helm chart push ${{ env.containerRegistry }}/helm/content-web:v${{ env.tag }}
+      env:
+        HELM_EXPERIMENTAL_OCI: 1
         
-    # - name: Deploy to AKS
-    #   uses: azure/k8s-deploy@v1
-    #   with:
-    #     manifests: |
-    #       web.deployment.yml
-    #       web.service.yml
-    #     images: |
-    #       ${{ env.containerRegistry }}.azurecr.io/${{ env.imageRepository }}:${{ env.tag }}
-    #     imagepullsecrets: |
-    #       ingress-demo-secret
-    #     namespace: ingress-demo
+ aks-deployment:
+    name: AKS Deployment
+    runs-on: ubuntu-latest
+    needs: [build-and-publish-docker-image,build-and-push-helm-chart]
+    steps:
+    # Checkout the repo
+    - uses: actions/checkout@master
+    
+    - name: Helm Install
+      uses: azure/setup-helm@v1
+      with:
+        version: v3.4.0
+        
+    - name: kubeconfig
+      run: echo "${{ secrets.KUBECONFIG }}" >> kubeconfig
+
+    - name: Helm Repo Add
+      run: |
+        helm repo add ${{ env.containerRegistry }} https://${{ env.containerRegistry }}/helm/v1/repo --username ${{ secrets.ACR_USERNAME }} --password ${{ secrets.ACR_PASSWORD }}
+        helm repo update
+      env:
+        HELM_EXPERIMENTAL_OCI: 1
+    
+    - name: Helm Upgrade
+      run: |
+        helm registry login ${{ env.containerRegistry }} --username ${{ secrets.ACR_USERNAME }} --password ${{ secrets.ACR_PASSWORD }}
+        helm chart pull ${{ env.containerRegistry }}/helm/content-web:v${{ env.tag }}
+        helm chart export ${{ env.containerRegistry }}/helm/content-web:v${{ env.tag }} --destination ./upgrade
+        helm upgrade web ./upgrade/web
+      env:
+        KUBECONFIG: './kubeconfig'
+        HELM_EXPERIMENTAL_OCI: 1
+
